@@ -9,7 +9,10 @@ existing tutor-profile publisher.
 - legacy `photo` with one URL or one URL per line;
 - `media` or `photos` with up to three URLs;
 - one URL publishes one media post; two or three publish a Telegram album;
-- HTML: `<b>`, `<i>`, `<u>`, `<s>`, `<a href>`, `<tg-spoiler>`, `<br>`;
+- HTML: `<b>`, `<i>`, `<u>`, `<s>`, `<a href>`, `<tg-spoiler>`,
+  `<blockquote>` and `<blockquote expandable>`;
+- `<br>`, `<p>` and `<div>` are converted to real Telegram newlines;
+- ordinary Unicode emoji are preserved (Premium custom emoji are not used);
 - up to two URL buttons in `buttons`, `inline_buttons`, or `inline_keyboard`.
 
 `photo` remains supported for existing Make scenarios. The service selects `media`, then `photos`, then line-separated `photo` values.
@@ -43,7 +46,9 @@ Response for this request includes:
   "media_mode": "album",
   "media_position": "above_text",
   "parse_mode": "HTML",
-  "blockquote": false,
+  "blockquote": true,
+  "spoiler": true,
+  "unicode_emojis": true,
   "custom_emojis": false,
   "buttons_count": 2
 }
