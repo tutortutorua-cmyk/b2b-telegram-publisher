@@ -19,12 +19,22 @@ from telethon.sessions import StringSession
 
 API_ID = int(os.environ["TELEGRAM_API_ID"])
 API_HASH = os.environ["TELEGRAM_API_HASH"]
-SESSION_STRING = os.environ["TELEGRAM_SESSION"]
+# A user session is sufficient for regular channel posts. Telegram permits
+# inline keyboards only for bot accounts, so B2B may optionally use a bot
+# token without changing the shared B2C session.
+SESSION_STRING = os.getenv("TELEGRAM_SESSION", "")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 MAKE_API_KEY = os.environ["MAKE_API_KEY"]
 DEFAULT_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "@tutortutor")
 
 app = FastAPI(title="Tutor.ua B2B Telegram Publisher")
-client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+client: TelegramClient | None = None
+
+
+def telegram_client() -> TelegramClient:
+    if client is None:
+        raise RuntimeError("Telegram client is not connected.")
+    return client
 
 
 class InlineButton(BaseModel):
@@ -167,7 +177,7 @@ class TelegramHTML(HTMLParser):
     def result(self) -> str:
         value = "".join(self.parts)
         value = re.sub(r"</?blockquote[^>]*>", "", value, flags=re.I)
-        value = re.sub(r"\(?\s*Про\s+мене\s*\)?\s*:?", "", value, flags=re.I)
+        value = re.sub(r"\(?\s*ÐŸÑ€Ð¾\s+Ð¼ÐµÐ½Ðµ\s*\)?\s*:?", "", value, flags=re.I)
         value = re.sub(r"(?:<br>\s*){3,}", "<br><br>", value)
         return value.strip(" \n")
 
@@ -189,21 +199,21 @@ def build_caption(payload: PublishRequest) -> str:
         if payload.name:
             parts.append(f"<b>{payload.name}</b>")
         if payload.subject:
-            parts.append(f"<b>Предмет:</b> {payload.subject}")
+            parts.append(f"<b>ÐŸÑ€ÐµÐ´Ð¼ÐµÑ‚:</b> {payload.subject}")
         if payload.features:
-            parts.append(f"<b>Особливості:</b><br>{payload.features}")
+            parts.append(f"<b>ÐžÑÐ¾Ð±Ð»Ð¸Ð²Ð¾ÑÑ‚Ñ–:</b><br>{payload.features}")
         if payload.age:
-            parts.append(f"<b>Вік:</b> {payload.age}")
+            parts.append(f"<b>Ð’Ñ–Ðº:</b> {payload.age}")
         if payload.about:
             parts.append(payload.about)
         if payload.individual_lessons:
-            parts.append(f"<b>Індивідуальні заняття:</b><br>{payload.individual_lessons}")
+            parts.append(f"<b>Ð†Ð½Ð´Ð¸Ð²Ñ–Ð´ÑƒÐ°Ð»ÑŒÐ½Ñ– Ð·Ð°Ð½ÑÑ‚Ñ‚Ñ:</b><br>{payload.individual_lessons}")
         if payload.group_lessons:
-            parts.append(f"<b>Групові заняття:</b><br>{payload.group_lessons}")
+            parts.append(f"<b>Ð“Ñ€ÑƒÐ¿Ð¾Ð²Ñ– Ð·Ð°Ð½ÑÑ‚Ñ‚Ñ:</b><br>{payload.group_lessons}")
         if payload.other_lessons:
-            parts.append(f"<b>Інші заняття:</b><br>{payload.other_lessons}")
+            parts.append(f"<b>Ð†Ð½ÑˆÑ– Ð·Ð°Ð½ÑÑ‚Ñ‚Ñ:</b><br>{payload.other_lessons}")
         if payload.resources:
-            parts.append(f"<b>Додаткові ресурси:</b><br>{payload.resources}")
+            parts.append(f"<b>Ð”Ð¾Ð´Ð°Ñ‚ÐºÐ¾Ð²Ñ– Ñ€ÐµÑÑƒÑ€ÑÐ¸:</b><br>{payload.resources}")
         if payload.hashtags:
             parts.append(payload.hashtags)
         if payload.contacts:
@@ -211,7 +221,7 @@ def build_caption(payload: PublishRequest) -> str:
         if payload.footer:
             parts.append(payload.footer)
         if payload.contact_url:
-            parts.append(f'<a href="{payload.contact_url}">ЗВ’ЯЗАТИСЯ</a>')
+            parts.append(f'<a href="{payload.contact_url}">Ð—Ð’â€™Ð¯Ð—ÐÐ¢Ð˜Ð¡Ð¯</a>')
         caption = "<br><br>".join(parts)
     return normalize_html(caption)
 
@@ -237,26 +247,28 @@ def telethon_buttons(keyboard: dict[str, list[list[dict[str, str]]]] | None):
 
 
 async def publish_single_post(channel: str, media: str | None, caption: str, buttons):
+    telegram = telegram_client()
     if media:
-        return await client.send_file(channel, file=media, caption=caption, parse_mode="html", buttons=buttons)
-    return await client.send_message(channel, message=caption, parse_mode="html", link_preview=False, buttons=buttons)
+        return await telegram.send_file(channel, file=media, caption=caption, parse_mode="html", buttons=buttons)
+    return await telegram.send_message(channel, message=caption, parse_mode="html", link_preview=False, buttons=buttons)
 
 
 async def publish_media_group(channel: str, media: list[str], caption: str, buttons):
     # Telegram creates albums as a separate RPC. It cannot receive reply markup
     # in the initial call, so add URL buttons to the captioned first message.
     captions = [caption] + [""] * (len(media) - 1)
-    messages = await client.send_file(channel, file=media, caption=captions, parse_mode="html")
+    telegram = telegram_client()
+    messages = await telegram.send_file(channel, file=media, caption=captions, parse_mode="html")
     first = messages[0] if isinstance(messages, list) else messages
     if buttons:
-        await client.edit_message(channel, first.id, caption, parse_mode="html", buttons=buttons)
+        await telegram.edit_message(channel, first.id, caption, parse_mode="html", buttons=buttons)
     return messages
 
 
 async def assert_button_capability(buttons) -> None:
     if not buttons:
         return
-    identity = await client.get_me()
+    identity = await telegram_client().get_me()
     if not getattr(identity, "bot", False):
         raise HTTPException(
             status_code=422,
@@ -266,6 +278,14 @@ async def assert_button_capability(buttons) -> None:
 
 @app.on_event("startup")
 async def startup():
+    global client
+    # A bot token gives Telegram permission to attach inline keyboards. Use an
+    # ephemeral session here: the token itself is the durable credential.
+    session = StringSession() if BOT_TOKEN else StringSession(SESSION_STRING)
+    client = TelegramClient(session, API_ID, API_HASH)
+    if BOT_TOKEN:
+        await client.start(bot_token=BOT_TOKEN)
+        return
     await client.connect()
     if not await client.is_user_authorized():
         raise RuntimeError("Telegram session is not authorized.")
@@ -273,7 +293,8 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    await client.disconnect()
+    if client:
+        await client.disconnect()
 
 
 @app.get("/health")
