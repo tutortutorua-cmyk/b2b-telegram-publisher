@@ -245,6 +245,12 @@ class TelegramParseMode:
 TELEGRAM_PARSE_MODE = TelegramParseMode()
 
 
+def visible_text_length(value: str) -> int:
+    """Return the length Telegram applies to text/caption limits."""
+    text, _ = TELEGRAM_PARSE_MODE.parse(value)
+    return len(text)
+
+
 def build_caption(payload: PublishRequest) -> str:
     if payload.text:
         caption = payload.text
@@ -339,6 +345,31 @@ async def publish_media_group(channel: str, media: list[str], caption: str, butt
     return messages
 
 
+async def publish_media_then_text(channel: str, media: list[str], caption: str, buttons):
+    """Publish media above a long, separately formatted text message.
+
+    Telegram media captions are limited to 1,024 characters, while a normal
+    message supports 4,096. If the text send fails, remove the already-created
+    media so a Make retry cannot leave duplicates behind.
+    """
+    telegram = telegram_client()
+    media_input: str | list[str] = media[0] if len(media) == 1 else media
+    published = await telegram.send_file(channel, file=media_input)
+    media_messages = published if isinstance(published, list) else [published]
+    try:
+        text_message = await telegram.send_message(
+            channel,
+            message=caption,
+            parse_mode=TELEGRAM_PARSE_MODE,
+            link_preview=False,
+            buttons=buttons,
+        )
+    except Exception:
+        await telegram.delete_messages(channel, [message.id for message in media_messages])
+        raise
+    return text_message, media_messages
+
+
 async def assert_button_capability(buttons) -> None:
     if not buttons:
         return
@@ -387,16 +418,19 @@ async def publish(payload: PublishRequest, authorization: str | None = Header(de
     caption = build_caption(payload)
     keyboard = build_keyboard(payload)
 
-    # Telegram accepts up to 1,024 characters for a media caption and 4,096
-    # for a text-only message. This avoids partial album creation.
-    limit = 1024 if media else 4096
-    if len(re.sub(r"<[^>]+>", "", caption)) > limit:
-        raise HTTPException(status_code=400, detail=f"Text too long: max {limit} visible characters for this post.")
+    # Long copy cannot fit into a media caption. Keep the media above it and
+    # publish the formatted copy as a separate Telegram text message instead.
+    text_length = visible_text_length(caption)
+    if text_length > 4096:
+        raise HTTPException(status_code=400, detail="Text too long: max 4096 visible characters for this post.")
 
     try:
         buttons = telethon_buttons(keyboard)
         await assert_button_capability(buttons)
-        if len(media) > 1:
+        if media and text_length > 1024:
+            first, media_messages = await publish_media_then_text(channel, media, caption, buttons)
+            media_mode = "album_with_text" if len(media) > 1 else "single_media_with_text"
+        elif len(media) > 1:
             messages = await publish_media_group(channel, media, caption, buttons)
             first = messages[0] if isinstance(messages, list) else messages
             media_mode = "album"

@@ -13,6 +13,8 @@ existing tutor-profile publisher.
   `<blockquote>` and `<blockquote expandable>`;
 - `<br>`, `<p>` and `<div>` are converted to real Telegram newlines;
 - ordinary Unicode emoji are preserved (Premium custom emoji are not used);
+- copy longer than Telegram's 1,024-character media-caption limit is sent as
+  a separate formatted message below the media (up to 4,096 characters);
 - up to two URL buttons in `buttons`, `inline_buttons`, or `inline_keyboard`.
 
 `photo` remains supported for existing Make scenarios. The service selects `media`, then `photos`, then line-separated `photo` values.
