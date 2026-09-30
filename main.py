@@ -34,12 +34,14 @@ DEFAULT_CHANNEL = os.getenv("TELEGRAM_CHANNEL", "@tutortutor")
 
 app = FastAPI(title="Tutor.ua B2B Telegram Publisher")
 client: TelegramClient | None = None
+bot_client: TelegramClient | None = None
 
 
-def telegram_client() -> TelegramClient:
-    if client is None:
+def telegram_client(require_bot: bool = False) -> TelegramClient:
+    selected = bot_client if require_bot else client
+    if selected is None:
         raise RuntimeError("Telegram client is not connected.")
-    return client
+    return selected
 
 
 class InlineButton(BaseModel):
@@ -296,8 +298,8 @@ def telethon_buttons(keyboard: dict[str, list[list[dict[str, str]]]] | None):
     return [[Button.url(item["text"], item["url"]) for item in row] for row in keyboard["inline_keyboard"]]
 
 
-async def publish_single_post(channel: str, media: str | None, caption: str, buttons):
-    telegram = telegram_client()
+async def publish_single_post(channel: str, media: str | None, caption: str, buttons, telegram=None):
+    telegram = telegram or telegram_client(require_bot=bool(buttons))
     if media:
         return await telegram.send_file(channel, file=media, caption=caption, parse_mode=TELEGRAM_PARSE_MODE, buttons=buttons)
     return await telegram.send_message(
@@ -305,11 +307,11 @@ async def publish_single_post(channel: str, media: str | None, caption: str, but
     )
 
 
-async def publish_media_group(channel: str, media: list[str], caption: str, buttons):
+async def publish_media_group(channel: str, media: list[str], caption: str, buttons, telegram=None):
     # Telegram creates albums as a separate RPC. It cannot receive reply markup
     # in the initial call, so add URL buttons to the captioned first message.
     captions = [caption] + [""] * (len(media) - 1)
-    telegram = telegram_client()
+    telegram = telegram or telegram_client(require_bot=bool(buttons))
     messages = await telegram.send_file(channel, file=media, caption=captions, parse_mode=TELEGRAM_PARSE_MODE)
     first = messages[0] if isinstance(messages, list) else messages
     if buttons:
@@ -333,14 +335,14 @@ async def publish_media_group(channel: str, media: list[str], caption: str, butt
     return messages
 
 
-async def publish_media_then_text(channel: str, media: list[str], caption: str, buttons):
+async def publish_media_then_text(channel: str, media: list[str], caption: str, buttons, telegram=None):
     """Publish media above a long, separately formatted text message.
 
     Telegram media captions are limited to 1,024 characters, while a normal
     message supports 4,096. If the text send fails, remove the already-created
     media so a Make retry cannot leave duplicates behind.
     """
-    telegram = telegram_client()
+    telegram = telegram or telegram_client(require_bot=bool(buttons))
     media_input: str | list[str] = media[0] if len(media) == 1 else media
     published = await telegram.send_file(channel, file=media_input)
     media_messages = published if isinstance(published, list) else [published]
@@ -358,14 +360,14 @@ async def publish_media_then_text(channel: str, media: list[str], caption: str, 
     return text_message, media_messages
 
 
-async def publish_link_preview_post(channel: str, media_url: str, caption: str, buttons):
+async def publish_link_preview_post(channel: str, media_url: str, caption: str, buttons, telegram=None):
     """Publish long copy and one media URL as a single preview message.
 
     A normal Telegram text message supports 4,096 visible characters. An
     explicit InputMediaWebPage renders the image URL as a large preview above
     the copy without exposing the raw URL or consuming caption characters.
     """
-    telegram = telegram_client()
+    telegram = telegram or telegram_client(require_bot=bool(buttons))
     peer = await telegram.get_input_entity(channel)
     text, entities = TELEGRAM_PARSE_MODE.parse(caption)
     request = functions.messages.SendMediaRequest(
@@ -381,14 +383,14 @@ async def publish_link_preview_post(channel: str, media_url: str, caption: str, 
     return telegram._get_response_message(request, result, peer)
 
 
-async def disable_post_comments(channel: str, message) -> None:
+async def disable_post_comments(channel: str, message, telegram=None) -> None:
     """Remove the post's auto-forward from the linked discussion group.
 
     Telegram implements a channel comment section as the thread below that
     auto-forward. Removing it is the documented per-post way to disable
     comments while leaving the channel's discussion group enabled elsewhere.
     """
-    telegram = telegram_client()
+    telegram = telegram or telegram_client()
     channel_info = await telegram(functions.channels.GetFullChannelRequest(channel=channel))
     if not getattr(channel_info.full_chat, "linked_chat_id", None):
         return
@@ -421,10 +423,10 @@ async def disable_post_comments(channel: str, message) -> None:
     await telegram.delete_messages(root.peer_id, [root.id])
 
 
-async def assert_button_capability(buttons) -> None:
+async def assert_button_capability(buttons, telegram) -> None:
     if not buttons:
         return
-    identity = await telegram_client().get_me()
+    identity = await telegram.get_me()
     if not getattr(identity, "bot", False):
         raise HTTPException(
             status_code=422,
@@ -434,23 +436,27 @@ async def assert_button_capability(buttons) -> None:
 
 @app.on_event("startup")
 async def startup():
-    global client
-    # A bot token gives Telegram permission to attach inline keyboards. Use an
-    # ephemeral session here: the token itself is the durable credential.
-    session = StringSession() if BOT_TOKEN else StringSession(SESSION_STRING)
-    client = TelegramClient(session, API_ID, API_HASH)
+    global client, bot_client
+    # Keep both identities available. User MTProto is required to remove a
+    # discussion copy, while the bot identity is required for URL buttons.
+    if SESSION_STRING:
+        client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH)
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Telegram user session is not authorized.")
     if BOT_TOKEN:
-        await client.start(bot_token=BOT_TOKEN)
-        return
-    await client.connect()
-    if not await client.is_user_authorized():
-        raise RuntimeError("Telegram session is not authorized.")
+        bot_client = TelegramClient(StringSession(), API_ID, API_HASH)
+        await bot_client.start(bot_token=BOT_TOKEN)
+    if client is None:
+        client = bot_client
 
 
 @app.on_event("shutdown")
 async def shutdown():
     if client:
         await client.disconnect()
+    if bot_client and bot_client is not client:
+        await bot_client.disconnect()
 
 
 @app.get("/health")
@@ -482,19 +488,35 @@ async def publish(payload: PublishRequest, authorization: str | None = Header(de
 
     try:
         buttons = telethon_buttons(keyboard)
-        await assert_button_capability(buttons)
+        comments_allowed = bool(buttons)
+        telegram = telegram_client(require_bot=bool(buttons))
+        await assert_button_capability(buttons, telegram)
+        identity = await telegram.get_me()
+        if not comments_allowed and getattr(identity, "bot", False):
+            raise HTTPException(
+                status_code=422,
+                detail="Posts without buttons require TELEGRAM_SESSION so comments can be disabled before publication.",
+            )
         if media and text_length > 1024:
-            first = await publish_link_preview_post(channel, media[0], caption, buttons)
+            first = await publish_link_preview_post(channel, media[0], caption, buttons, telegram)
             media_mode = "link_preview"
         elif len(media) > 1:
-            messages = await publish_media_group(channel, media, caption, buttons)
+            messages = await publish_media_group(channel, media, caption, buttons, telegram)
             first = messages[0] if isinstance(messages, list) else messages
             media_mode = "album"
         else:
-            first = await publish_single_post(channel, media[0] if media else None, caption, buttons)
+            first = await publish_single_post(channel, media[0] if media else None, caption, buttons, telegram)
             media_mode = "single_media" if media else "text"
-        if not payload.allow_comments:
-            await disable_post_comments(channel, first)
+        comments_disabled = False
+        comments_warning = None
+        if not comments_allowed:
+            try:
+                await disable_post_comments(channel, first, telegram)
+                comments_disabled = True
+            except Exception as exc:
+                # The post already exists. Return success so Make never retries
+                # the completed publication and creates duplicates.
+                comments_warning = str(exc)
         return {
             "success": True,
             "message_id": first.id,
@@ -508,7 +530,9 @@ async def publish(payload: PublishRequest, authorization: str | None = Header(de
             "unicode_emojis": True,
             "custom_emojis": False,
             "buttons_count": sum(len(row) for row in (keyboard or {"inline_keyboard": []})["inline_keyboard"]),
-            "allow_comments": payload.allow_comments,
+            "allow_comments": comments_allowed,
+            "comments_disabled": comments_disabled,
+            "comments_warning": comments_warning,
         }
     except HTTPException:
         raise
