@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, HttpUrl
 from telethon import Button, TelegramClient, functions, types
 from telethon.errors import MessageNotModifiedError
 from telethon.extensions import html as telethon_html
-from telethon.helpers import add_surrogate, generate_random_long
+from telethon.helpers import add_surrogate, del_surrogate, generate_random_long, strip_text
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageEntitySpoiler
 
@@ -187,37 +187,29 @@ def normalize_html(value: str) -> str:
     return parser.result()
 
 
-class SpoilerOffsets(HTMLParser):
-    """Collect UTF-16 offsets Telethon's stock HTML parser omits."""
+class TelegramEntityParser(telethon_html.HTMLToTelegramParser):
+    """Telethon's HTML parser with native ``tg-spoiler`` support.
 
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.text_offset = 0
-        self.starts: list[int] = []
-        self.entities: list[MessageEntitySpoiler] = []
-        self.collapsed_quotes: list[tuple[int, int]] = []
-        self.quote_starts: list[int] = []
+    Parsing every entity in one UTF-16-aware pass prevents spoiler offsets
+    from drifting when emoji or nested formatting precedes the hidden text.
+    """
 
-    def handle_starttag(self, tag: str, attrs) -> None:
+    def handle_starttag(self, tag, attrs):
         tag = tag.lower()
-        if tag == "tg-spoiler":
-            self.starts.append(self.text_offset)
-        elif tag == "blockquote" and any(name.lower() == "expandable" for name, _ in attrs):
-            self.quote_starts.append(self.text_offset)
-
-    def handle_endtag(self, tag: str) -> None:
-        tag = tag.lower()
-        if tag == "tg-spoiler" and self.starts:
-            start = self.starts.pop()
-            if self.text_offset > start:
-                self.entities.append(MessageEntitySpoiler(offset=start, length=self.text_offset - start))
-        elif tag == "blockquote" and self.quote_starts:
-            start = self.quote_starts.pop()
-            if self.text_offset > start:
-                self.collapsed_quotes.append((start, self.text_offset - start))
-
-    def handle_data(self, data: str) -> None:
-        self.text_offset += len(add_surrogate(data))
+        if tag != "tg-spoiler":
+            super().handle_starttag(tag, attrs)
+            if tag == "blockquote" and any(name.lower() == "expandable" for name, _ in attrs):
+                entity = self._building_entities.get("blockquote")
+                if entity:
+                    entity.collapsed = True
+            return
+        self._open_tags.appendleft("tg-spoiler")
+        self._open_tags_meta.appendleft(None)
+        if "tg-spoiler" not in self._building_entities:
+            self._building_entities["tg-spoiler"] = MessageEntitySpoiler(
+                offset=len(self.text),
+                length=0,
+            )
 
 
 class TelegramParseMode:
@@ -225,17 +217,12 @@ class TelegramParseMode:
 
     @staticmethod
     def parse(value: str):
-        text, entities = telethon_html.parse(value)
-        parser = SpoilerOffsets()
-        parser.feed(value)
-        parser.close()
-        entities.extend(parser.entities)
-        collapsed = set(parser.collapsed_quotes)
-        for entity in entities:
-            if type(entity).__name__ == "MessageEntityBlockquote" and (entity.offset, entity.length) in collapsed:
-                entity.collapsed = True
-        entities.sort(key=lambda entity: entity.offset)
-        return text, entities
+        parser = TelegramEntityParser()
+        parser.feed(add_surrogate(value or ""))
+        text = strip_text(parser.text, parser.entities)
+        parser.entities.reverse()
+        entities = sorted(parser.entities, key=lambda entity: entity.offset)
+        return del_surrogate(text), entities
 
     @staticmethod
     def unparse(text: str, entities):
@@ -393,6 +380,30 @@ async def publish_link_preview_post(channel: str, media_url: str, caption: str, 
     return telegram._get_response_message(request, result, peer)
 
 
+async def disable_post_comments(channel: str, message) -> None:
+    """Remove the post's auto-forward from the linked discussion group.
+
+    Telegram implements a channel comment section as the thread below that
+    auto-forward. Removing it is the documented per-post way to disable
+    comments while leaving the channel's discussion group enabled elsewhere.
+    """
+    replies = getattr(message, "replies", None)
+    if not replies or not getattr(replies, "channel_id", None):
+        return
+
+    telegram = telegram_client()
+    discussion = await telegram(
+        functions.messages.GetDiscussionMessageRequest(peer=channel, msg_id=message.id)
+    )
+    if not discussion.messages:
+        raise RuntimeError("Telegram did not return the discussion message for this post.")
+
+    # Telegram returns discussion messages newest first; the last one is the
+    # auto-forward that starts the comment thread.
+    root = discussion.messages[-1]
+    await telegram.delete_messages(root.peer_id, [root.id])
+
+
 async def assert_button_capability(buttons) -> None:
     if not buttons:
         return
@@ -465,6 +476,8 @@ async def publish(payload: PublishRequest, authorization: str | None = Header(de
         else:
             first = await publish_single_post(channel, media[0] if media else None, caption, buttons)
             media_mode = "single_media" if media else "text"
+        if not payload.allow_comments:
+            await disable_post_comments(channel, first)
         return {
             "success": True,
             "message_id": first.id,

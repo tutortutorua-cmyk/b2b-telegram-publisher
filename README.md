@@ -18,6 +18,8 @@ existing tutor-profile publisher.
   preview (up to 4,096 visible characters);
 - posts longer than 1,024 visible characters accept exactly one media item;
   requests with two or three media items are rejected before publication;
+- `allow_comments: false` removes the post's auto-forward from the linked
+  discussion group, disabling comments for that post only;
 - up to two URL buttons in `buttons`, `inline_buttons`, or `inline_keyboard`.
 
 `photo` remains supported for existing Make scenarios. The service selects `media`, then `photos`, then line-separated `photo` values.

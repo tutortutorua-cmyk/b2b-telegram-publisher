@@ -10,6 +10,7 @@ from main import (
     PublishRequest,
     build_caption,
     build_keyboard,
+    disable_post_comments,
     normalize_media,
     publish,
     publish_link_preview_post,
@@ -24,6 +25,11 @@ text, entities = TELEGRAM_PARSE_MODE.parse(caption)
 assert text == 'Жирний\nЦитата\nСекрет🙂'
 assert any(isinstance(entity, MessageEntityBlockquote) and entity.collapsed for entity in entities)
 assert any(isinstance(entity, MessageEntitySpoiler) for entity in entities)
+emoji_text, emoji_entities = TELEGRAM_PARSE_MODE.parse('👋 Перед <tg-spoiler>Секрет</tg-spoiler> після')
+emoji_spoiler = next(entity for entity in emoji_entities if isinstance(entity, MessageEntitySpoiler))
+assert emoji_text == '👋 Перед Секрет після'
+assert emoji_spoiler.offset == 9
+assert emoji_spoiler.length == len('Секрет')
 assert visible_text_length(caption) == len('Жирний\nЦитата\nСекрет🙂')
 assert visible_text_length('<b>' + ('А' * 1025) + '</b>') == 1025
 assert build_keyboard(payload) == {'inline_keyboard': [[{'text':'Старт','url':'https://example.com/start'}, {'text':'Фініш','url':'https://example.com/end'}]]}
@@ -78,4 +84,25 @@ assert fake.request.media.url == 'https://example.com/photo.jpg?x=1&y=2'
 assert fake.request.media.force_large_media is True
 assert fake.request.invert_media is True
 assert fake.request.message == 'Довгий текст'
+
+class FakeDiscussionTelegram:
+    def __init__(self):
+        self.deleted = None
+
+    async def __call__(self, request):
+        return SimpleNamespace(messages=[SimpleNamespace(id=77, peer_id='@discussion')])
+
+    async def delete_messages(self, peer, ids):
+        self.deleted = (peer, ids)
+
+discussion_fake = FakeDiscussionTelegram()
+main.client = discussion_fake
+try:
+    asyncio.run(disable_post_comments(
+        '@test',
+        SimpleNamespace(id=123, replies=SimpleNamespace(channel_id=456)),
+    ))
+finally:
+    main.client = original_client
+assert discussion_fake.deleted == ('@discussion', [77])
 print('publisher helper tests passed')
