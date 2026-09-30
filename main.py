@@ -14,10 +14,10 @@ from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, HttpUrl
-from telethon import Button, TelegramClient
+from telethon import Button, TelegramClient, functions, types
 from telethon.errors import MessageNotModifiedError
 from telethon.extensions import html as telethon_html
-from telethon.helpers import add_surrogate
+from telethon.helpers import add_surrogate, generate_random_long
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageEntitySpoiler
 
@@ -370,6 +370,29 @@ async def publish_media_then_text(channel: str, media: list[str], caption: str, 
     return text_message, media_messages
 
 
+async def publish_link_preview_post(channel: str, media_url: str, caption: str, buttons):
+    """Publish long copy and one media URL as a single preview message.
+
+    A normal Telegram text message supports 4,096 visible characters. An
+    explicit InputMediaWebPage renders the image URL as a large preview above
+    the copy without exposing the raw URL or consuming caption characters.
+    """
+    telegram = telegram_client()
+    peer = await telegram.get_input_entity(channel)
+    text, entities = TELEGRAM_PARSE_MODE.parse(caption)
+    request = functions.messages.SendMediaRequest(
+        peer=peer,
+        media=types.InputMediaWebPage(url=media_url, force_large_media=True),
+        message=text,
+        random_id=generate_random_long(),
+        reply_markup=telegram.build_reply_markup(buttons),
+        entities=entities,
+        invert_media=True,
+    )
+    result = await telegram(request)
+    return telegram._get_response_message(request, result, peer)
+
+
 async def assert_button_capability(buttons) -> None:
     if not buttons:
         return
@@ -423,13 +446,18 @@ async def publish(payload: PublishRequest, authorization: str | None = Header(de
     text_length = visible_text_length(caption)
     if text_length > 4096:
         raise HTTPException(status_code=400, detail="Text too long: max 4096 visible characters for this post.")
+    if text_length > 1024 and len(media) > 1:
+        raise HTTPException(
+            status_code=422,
+            detail="Posts longer than 1024 visible characters may contain only one media item.",
+        )
 
     try:
         buttons = telethon_buttons(keyboard)
         await assert_button_capability(buttons)
         if media and text_length > 1024:
-            first, media_messages = await publish_media_then_text(channel, media, caption, buttons)
-            media_mode = "album_with_text" if len(media) > 1 else "single_media_with_text"
+            first = await publish_link_preview_post(channel, media[0], caption, buttons)
+            media_mode = "link_preview"
         elif len(media) > 1:
             messages = await publish_media_group(channel, media, caption, buttons)
             first = messages[0] if isinstance(messages, list) else messages
@@ -443,7 +471,7 @@ async def publish(payload: PublishRequest, authorization: str | None = Header(de
             "profile_id": str(payload.profile_id),
             "media_count": len(media),
             "media_mode": media_mode,
-            "media_position": "above_text",
+            "media_position": "preview_above_text" if media_mode == "link_preview" else "above_text",
             "parse_mode": "HTML",
             "blockquote": "<blockquote" in caption,
             "spoiler": "<tg-spoiler>" in caption,
