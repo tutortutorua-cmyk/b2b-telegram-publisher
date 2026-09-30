@@ -5,6 +5,7 @@ with up to three media URLs, Telegram-safe HTML and inline buttons.
 """
 from __future__ import annotations
 
+import asyncio
 import html
 import os
 import re
@@ -15,7 +16,7 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field, HttpUrl
 from telethon import Button, TelegramClient, functions, types
-from telethon.errors import MessageNotModifiedError
+from telethon.errors import MessageNotModifiedError, RPCError
 from telethon.extensions import html as telethon_html
 from telethon.helpers import add_surrogate, del_surrogate, generate_random_long, strip_text
 from telethon.sessions import StringSession
@@ -387,16 +388,32 @@ async def disable_post_comments(channel: str, message) -> None:
     auto-forward. Removing it is the documented per-post way to disable
     comments while leaving the channel's discussion group enabled elsewhere.
     """
-    replies = getattr(message, "replies", None)
-    if not replies or not getattr(replies, "channel_id", None):
+    telegram = telegram_client()
+    channel_info = await telegram(functions.channels.GetFullChannelRequest(channel=channel))
+    if not getattr(channel_info.full_chat, "linked_chat_id", None):
         return
 
-    telegram = telegram_client()
-    discussion = await telegram(
-        functions.messages.GetDiscussionMessageRequest(peer=channel, msg_id=message.id)
-    )
-    if not discussion.messages:
-        raise RuntimeError("Telegram did not return the discussion message for this post.")
+    # The auto-forward is created asynchronously. The message returned by the
+    # send request normally has no `replies` field yet, so checking that field
+    # can incorrectly leave comments enabled. Poll the authoritative
+    # discussion endpoint for a few seconds instead.
+    discussion = None
+    last_error: Exception | None = None
+    for attempt in range(8):
+        try:
+            candidate = await telegram(
+                functions.messages.GetDiscussionMessageRequest(peer=channel, msg_id=message.id)
+            )
+            if candidate.messages:
+                discussion = candidate
+                break
+        except RPCError as exc:
+            last_error = exc
+        if attempt < 7:
+            await asyncio.sleep(0.5)
+    if discussion is None:
+        detail = f": {last_error}" if last_error else ""
+        raise RuntimeError(f"Telegram did not create the discussion message for this post{detail}")
 
     # Telegram returns discussion messages newest first; the last one is the
     # auto-forward that starts the comment thread.

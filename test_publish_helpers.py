@@ -90,6 +90,8 @@ class FakeDiscussionTelegram:
         self.deleted = None
 
     async def __call__(self, request):
+        if isinstance(request, main.functions.channels.GetFullChannelRequest):
+            return SimpleNamespace(full_chat=SimpleNamespace(linked_chat_id=456))
         return SimpleNamespace(messages=[SimpleNamespace(id=77, peer_id='@discussion')])
 
     async def delete_messages(self, peer, ids):
@@ -100,7 +102,7 @@ main.client = discussion_fake
 try:
     asyncio.run(disable_post_comments(
         '@test',
-        SimpleNamespace(id=123, replies=SimpleNamespace(channel_id=456)),
+        SimpleNamespace(id=123, replies=None),
     ))
 finally:
     main.client = original_client
